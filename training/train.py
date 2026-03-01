@@ -1,111 +1,94 @@
-
-"""
-EdufyaLLM Production Training Script
-Trains the 100M parameter Transformer model for long-term production use.
-"""
 import os
-import json
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from models.architecture import EdufyaLLM, ModelConfig
-from transformers import PreTrainedTokenizerFast
-from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn
-from rich.console import Console
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    BitsAndBytesConfig,
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import SFTTrainer
 
-console = Console()
-
-class EdufyaDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer, max_length: int = 512):
-        self.examples = []
-        if not os.path.exists(data_path):
-            console.print(f"[bold red]✗ Data file not found: {data_path}[/bold red]")
-            return
-            
-        with open(data_path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    item = json.loads(line)
-                    encoded = tokenizer(item["text"], truncation=True, max_length=max_length, padding=False, return_tensors="pt")
-                    if encoded["input_ids"].shape[1] > 1:
-                        self.examples.append(encoded["input_ids"].squeeze(0))
-                except: continue
-
-    def __len__(self): return len(self.examples)
-    def __getitem__(self, idx): return self.examples[idx]
-
-def collate_fn(batch, pad_token_id=0):
-    max_len = max(len(x) for x in batch)
-    padded_batch = []
-    for x in batch:
-        pad_len = max_len - len(x)
-        padded = torch.cat([x, torch.full((pad_len,), pad_token_id, dtype=torch.long)])
-        padded_batch.append(padded)
-    return torch.stack(padded_batch)
-
-def train(data_path: str = "data/processed.jsonl"):
-    tokenizer_path = "models/edufya-tokenizer"
-    model_save_path = "models/edufya-prod.pt"
+def train(data_path="data/processed.jsonl", num_epochs=1):
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    output_dir = "models/educational-qwen-0.5b-lora"
     
-    # ── PRODUCTION HYPERPARAMETERS ──
-    batch_size = 2 # Small batch to fit 100M parameters in RAM
-    lr = 3e-5
-    epochs = 40
-    max_length = 512
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-
-    if not os.path.exists(tokenizer_path):
-        console.print("[red]✗ Run train_tokenizer.py first.[/red]")
+    # Check if data exists
+    if not os.path.exists(data_path):
+        print(f"Data file not found: {data_path}. Run scraper and preprocess first.")
         return
 
-    tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
-    pad_id = tokenizer.pad_token_id
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.pad_token = tokenizer.eos_token
 
-    config = ModelConfig(
-        vocab_size=len(tokenizer),
-        max_context_len=max_length,
-        hidden_size=768,
-        num_layers=12,
-        num_heads=12,
-        intermediate_size=3072
+    # Load dataset
+    dataset = load_dataset("json", data_files=data_path, split="train")
+
+    # Quantization config (optional, might not work on CPU as expected, but kept for pattern)
+    # On CPU, we usually just use float32 or bfloat16 if supported.
+    # For Intel Mac, we'll stick to float32 or float16 if possible.
+    
+    print(f"Loading base model: {model_id}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.float32, # CPU friendly
+        device_map={"": "cpu"}, # Force CPU
     )
-    
-    model = EdufyaLLM(config).to(device)
-    num_params = sum(p.numel() for p in model.parameters())
-    console.print(f"[cyan]Training Production Model: {num_params / 1e6:.2f}M parameters[/cyan]")
 
-    dataset = EdufyaDataset(data_path, tokenizer, max_length=max_length)
-    from functools import partial
-    custom_collate = partial(collate_fn, pad_token_id=pad_id)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    
-    console.print(f"\n[bold]Starting Production Training Run — {len(dataset)} examples[/bold]\n")
-    model.train()
+    # LoRA config
+    peft_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
 
-    with Progress(TextColumn("{task.description}"), BarColumn(), "[progress.percentage]{task.percentage:>3.0f}%", TimeRemainingColumn(), console=console) as progress:
-        task = progress.add_task("[cyan]Training...", total=len(dataloader)*epochs)
-        for epoch in range(epochs):
-            for batch in dataloader:
-                batch = batch.to(device)
-                inputs, targets = batch[:, :-1], batch[:, 1:]
-                
-                optimizer.zero_grad()
-                logits, loss = model(inputs, targets)
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
 
-                if torch.isnan(loss):
-                    console.print("[red]!!! Loss is NaN. Aborting.[/red]")
-                    return
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        learning_rate=2e-4,
+        weight_decay=0.01,
+        logging_steps=10,
+        save_strategy="no", # Save manually at the end for simplicity
+        push_to_hub=False,
+        report_to="none",
+        use_cpu=True, # Force CPU training
+    )
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                
-                progress.update(task, advance=1, description=f"Epoch {epoch+1}/{epochs} | Loss: {loss.item():.4f}")
+    print("Starting training...")
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=dataset,
+        peft_config=peft_config,
+        dataset_text_field="text", # Using the pre-formatted ChatML field
+        max_seq_length=512,
+        tokenizer=tokenizer,
+        args=training_args,
+    )
 
-    torch.save({"model_state_dict": model.state_dict(), "config": config}, model_save_path)
-    console.print(f"\n[bold green]✓ Production Model Training Complete![/bold green]")
+    trainer.train()
+
+    # Save the adapter
+    print(f"Saving fine-tuned adapter to {output_dir}")
+    trainer.model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
 if __name__ == "__main__":
+    # Ensure trl is installed (added to requirements implicitly if I missed it)
+    try:
+        import trl
+    except ImportError:
+        print("Installing trl...")
+        os.system("python3.12 -m pip install trl")
+        
     train()

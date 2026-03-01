@@ -1,105 +1,83 @@
-# EdufyaLLM
+# 🎓 EdufyaLLM: Private Educational AI API
 
-> A custom 15M parameter educational LLM built from scratch with a Transformer architecture.
+EdufyaLLM is a custom-trained, small-scale Large Language Model (LLM) designed specifically for **educational mathematics tutoring**. It leverages a base Qwen model and is fine-tuned using Parameter-Efficient Fine-Tuning (PEFT) to provide step-by-step mathematical explanations with LaTeX formatting, delivered via a production-ready REST API.
 
-## Project Structure
+---
 
-```
-EdufyaLLM/
-├── api.py                          # FastAPI production server
-├── models/
-│   ├── architecture.py             # Custom Transformer model (RoPE, RMSNorm, SwiGLU)
-│   ├── edufya-tiny-15m.pt          # Trained model weights
-│   └── edufya-tokenizer/           # BPE tokenizer (16K vocab)
-├── training/
-│   ├── train.py                    # Model training script
-│   └── train_tokenizer.py          # Tokenizer training script
-├── data/
-│   ├── generate_react_data.py      # React + Math dataset generator
-│   └── processed.jsonl             # Training data
-├── utils/
-│   ├── scraper.py                  # Website scraper
-│   ├── preprocess.py               # Data preprocessor
-│   └── vector_db.py                # ChromaDB vector store
-├── Dockerfile
-├── docker-compose.yml
-└── requirements.txt
-```
+## 🚀 Key Features
 
-## Quick Start
+- **REST API First**: Designed to be integrated into any frontend or mobile application.
+- **Expert Mathematics Specialist**: System-prompted to provide clear, professional, and structured math solutions.
+- **Contextual Memory (RAG)**: Uses **ChromaDB** to remember and retrieve relevant facts from training data for more accurate answers.
+- **LaTeX Math Output**: Generates clean mathematical notation (e.g., $x^2 + y^2 = z^2$).
+- **Speed Optimized (Mac)**: Uses **MPS (Metal Performance Shaders)** and `float16` precision for fast inference on Mac GPU hardware.
+- **End-to-End Pipeline**: Includes tools for web scraping, data preprocessing, and model fine-tuning.
+- **Docker Enabled**: Production-ready containerization for easy cloud deployment.
 
-### 1. Setup
+---
+
+## 🛠 Dependencies & Why They are Used
+
+| Dependency                    | Purpose                                                                                                  |
+| :---------------------------- | :------------------------------------------------------------------------------------------------------- |
+| **transformers**              | The core library for loading the LLM (Qwen) and handling text generation.                                |
+| **peft**                      | Enables **LoRA (Low-Rank Adaptation)** training, allowing you to fine-tune the model on your laptop.     |
+| **torch / accelerate**        | The deep learning backend, optimized with `accelerate` for faster weights loading and device management. |
+| **fastapi / uvicorn**         | Serves the model as a high-performance web API with automatic documentation.                             |
+| **chromadb**                  | The Vector Database used for long-term memory and context retrieval (RAG).                               |
+| **sentence-transformers**     | Provides the embedding model used to turn text into vectors for the database.                            |
+| **beautifulsoup4 / requests** | Used in the scraping logic to collect educational content from the web for training.                     |
+| **datasets / trl**            | Handles the data pipeline and the supervised fine-tuning (SFT) process.                                  |
+| **rich**                      | Used for beautiful and readable terminal output during training progress.                                |
+
+---
+
+## 🚦 Getting Started
+
+### 1. Installation
+
+Clone the repo and install the requirements:
 
 ```bash
-python -m venv venv
-source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Generate Training Data
+### 2. Running the API (FastAPI)
 
 ```bash
-python -m data.generate_react_data
+uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 3. Train Tokenizer & Model
+_Access the interactive Swagger documentation at [http://localhost:8000/docs](http://localhost:8000/docs)_
+
+### 3. Usage Examples
+
+#### Get a Chat Response
 
 ```bash
-python -m training.train_tokenizer
-python -m training.train
+curl -X POST "http://localhost:8000/chat" \
+     -H "Content-Type: application/json" \
+     -d '{"prompt": "Explain the Pythagorean Theorem"}'
 ```
 
-### 4. Run API
+#### Start a Training Pipeline
 
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
+curl -X POST "http://localhost:8000/train" \
+     -H "Content-Type: application/json" \
+     -d '{"url": "https://example.com/math-lesson", "num_epochs": 1}'
 ```
 
-## API Endpoints
+---
 
-| Method | Endpoint  | Description                      |
-| ------ | --------- | -------------------------------- |
-| GET    | `/`       | API info                         |
-| GET    | `/health` | Health check & model status      |
-| POST   | `/chat`   | Chat with the model              |
-| POST   | `/train`  | Scrape a URL & retrain the model |
+## 🐳 Docker Deployment
 
-### Chat Example
+To run the API in a containerized environment:
 
 ```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "What is React?", "max_tokens": 128, "temperature": 0.7}'
+docker compose up --build
 ```
 
-### Train on a URL
+The API will be available at `http://localhost:8000`.
 
-```bash
-curl -X POST http://localhost:8000/train \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://react.dev/"}'
-```
-
-## Model Architecture
-
-- **Type**: Decoder-only Transformer
-- **Parameters**: ~15M
-- **Hidden size**: 256
-- **Layers**: 6
-- **Attention heads**: 8
-- **Context length**: 128 tokens
-- **Positional encoding**: RoPE (Rotary Position Embeddings)
-- **Normalization**: RMSNorm
-- **FFN**: SwiGLU activation
-- **Tokenizer**: BPE (16,384 vocab)
-
-## Docker
-
-```bash
-docker-compose up --build
-```
-
-## License
-
-Private educational project.
-# Omllm
+The API will be available at `http://localhost:8000`.
