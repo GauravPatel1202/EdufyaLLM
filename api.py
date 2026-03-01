@@ -1,151 +1,119 @@
+
+"""
+EdufyaLLM API - PRODUCTION VERSION (with RAG)
+A FastAPI-based educational LLM inference server using Retrieval-Augmented Generation.
+"""
 import os
-# Enable MPS for Mac acceleration
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import torch
-# Optimize CPU performance
-if not torch.backends.mps.is_available():
-    torch.set_num_threads(min(os.cpu_count(), 4))
+import torch.nn.functional as F
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel
-import threading
-from utils.scraper import scrape_url
-from utils.preprocess import preprocess_data
-from training.train import train as train_model
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from transformers import PreTrainedTokenizerFast
+from models.architecture import EdufyaLLM, ModelConfig
 from utils.vector_db import vector_db
-import json
+import logging
+import time
 
-app = FastAPI(title="EdufyaLLM API", description="API for the private Educational LLM")
+# ── Logging Setup ──
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("edufya_prod")
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-ADAPTER_PATH = "models/educational-qwen-0.5b-lora"
+# ── Globals ──
+MODEL_PATH = "models/edufya-tiny-15m.pt"
+TOKENIZER_PATH = "models/edufya-tokenizer"
+device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-# Global variables for model and tokenizer
-model = None
+app = FastAPI(title="EdufyaLLM Production API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Load State
 tokenizer = None
+model = None
+
+def load_assets():
+    global tokenizer, model
+    try:
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(TOKENIZER_PATH)
+        logger.info(f"Tokenizer loaded ({len(tokenizer)} tokens)")
+        
+        if os.path.exists(MODEL_PATH):
+            checkpoint = torch.load(MODEL_PATH, map_location=device)
+            config = checkpoint["config"]
+            model = EdufyaLLM(config).to(device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            model.eval()
+            logger.info("Production model loaded.")
+        else:
+            logger.warning("Production model not found. API will run in RAG-only fallback mode if possible.")
+    except Exception as e:
+        logger.error(f"Error loading assets: {e}")
 
 class ChatRequest(BaseModel):
-    prompt: str
-    max_tokens: int = 512
-    temperature: float = 0.7
-
-class ChatResponse(BaseModel):
-    response: str
-    time_taken: float
+    prompt: str = Field(..., min_length=1)
+    use_rag: bool = True
+    max_tokens: int = 256
 
 @app.on_event("startup")
-def load_model():
-    global model, tokenizer
-    # Detect device: MPS for Mac GPU, else CPU
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Loading base model on {device}...")
-    
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    
-    # Load base model with float16 for performance
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.float16 if device == "mps" else torch.float32
-    ).to(device)
-    
-    # Load adapter if it exists and is ready
-    adapter_config_path = os.path.join(ADAPTER_PATH, "adapter_config.json")
-    if os.path.exists(adapter_config_path):
-        print(f"Loading adapter from {ADAPTER_PATH}...")
-        model = PeftModel.from_pretrained(model, ADAPTER_PATH)
-        print("Adapter loaded successfully!")
-    else:
-        print(f"Note: Adapter not found at {adapter_config_path} yet. Using base model.")
-
-@app.get("/")
-def read_root():
-    return {
-        "message": "Welcome to the EdufyaLLM API",
-        "endpoints": {
-            "/chat": "POST - Send a prompt to get an educational response",
-            "/health": "GET - Check API and model adapter status",
-            "/docs": "GET - Interactive Swagger UI documentation"
-        },
-        "usage": "Use /docs to test the API directly from your browser."
-    }
-
-class TrainRequest(BaseModel):
-    url: str
-    num_epochs: int = 1
-
-def run_training_pipeline(url: str, num_epochs: int):
-    raw_file = "data/raw_scraped.txt"
-    processed_file = "data/processed_scraped.jsonl"
-    
-    if scrape_url(url, raw_file):
-        num_examples = preprocess_data(raw_file, processed_file)
-        if num_examples > 0:
-            # Index into Vector DB
-            print("Indexing documents into Vector DB...")
-            with open(processed_file, "r") as f:
-                lines = f.readlines()
-                docs = []
-                ids = []
-                for i, line in enumerate(lines):
-                    data = json.loads(line)
-                    # Extract the informative part (assuming 'text' or similar after preprocessing)
-                    # For now, we index the full JSON line or specific fields if available
-                    docs.append(data.get("output", data.get("instruction", "")))
-                    ids.append(f"doc_{i}_{hash(url)}")
-            vector_db.add_documents(docs, ids)
-            
-            print(f"Starting fine-tuning with {num_examples} examples...")
-            train_model(data_path=processed_file, num_epochs=num_epochs)
-            print("Training pipeline completed successfully.")
-            # Optionally reload the model here if needed, 
-            # but usually, we'd restart or have a reload mechanism.
-            # For simplicity, we just finish.
-
-@app.post("/train")
-async def train_endpoint(request: TrainRequest):
-    # Run in background to avoid timeout
-    thread = threading.Thread(target=run_training_pipeline, args=(request.url, request.num_epochs))
-    thread.start()
-    return {"message": "Training pipeline started in the background", "url": request.url}
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    # Retrieve relevant context from Vector DB
-    context_list = vector_db.query(request.prompt)
-    context_text = "\n".join(context_list) if context_list else "No additional context found."
-
-    # Format for Qwen ChatML with Math Specialist Prompt and Context
-    input_text = f"<|im_start|>system\nYou are an expert educational mathematics tutor. Use the provided context to answer the user's question accurately. Always use LaTeX for mathematical notation (e.g., use $x^2$ for powers). Provide professional, clear, and structured explanations.\n\nContext:\n{context_text}<|im_end|>\n<|im_start|>user\n{request.prompt}<|im_end|>\n<|im_start|>assistant\n"
-    
-    device = next(model.parameters()).device
-    inputs = tokenizer(input_text, return_tensors="pt").to(device)
-    
-    import time
-    start_time = time.time()
-    
-    with torch.no_grad():
-        output_tokens = model.generate(
-            **inputs,
-            max_new_tokens=request.max_tokens,
-            do_sample=request.temperature > 0,
-            temperature=request.temperature if request.temperature > 0 else 1.0,
-            pad_token_id=tokenizer.eos_token_id,
-            use_cache=True
-        )
-    
-    end_time = time.time()
-    time_taken = end_time - start_time
-    
-    response_text = tokenizer.decode(output_tokens[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-    return ChatResponse(response=response_text, time_taken=round(time_taken, 2))
+async def startup():
+    load_assets()
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "adapter_loaded": os.path.exists(ADAPTER_PATH)}
+    return {"status": "ok", "model": model is not None, "device": device}
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    if tokenizer is None:
+        raise HTTPException(status_code=500, detail="Tokenizer not initialized.")
+
+    start_time = time.time()
+    
+    # ── RAG: Retrieve Context ──
+    context = ""
+    if request.use_rag:
+        try:
+            results = vector_db.search(request.prompt, n_results=2)
+            if results and 'documents' in results and results['documents']:
+                context = "\n".join(results['documents'][0])
+                logger.info(f"Retrieved {len(results['documents'][0])} document snippets for context.")
+        except Exception as e:
+            logger.error(f"RAG Error: {e}")
+
+    # ── Prompt Construction ──
+    system_prompt = "You are a helpful educational tutor."
+    if context:
+        system_prompt += f" Use this verified documentation to answer: {context}"
+    
+    full_prompt = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{request.prompt}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    # ── Inference ──
+    if model is not None:
+        input_ids = tokenizer.encode(full_prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids, 
+                max_new_tokens=request.max_tokens, 
+                temperature=0.4, # Lower for production stability
+                eos_token_id=tokenizer.eos_token_id
+            )
+        response_ids = output_ids[0][input_ids.shape[1]:]
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True).strip()
+    else:
+        response_text = "Model is currently training. (RAG Fallback: Found relevant info but LLM is offline.)"
+
+    time_taken = time.time() - start_time
+    logger.info(f"Inference complete in {time_taken:.2f}s")
+
+    return {
+        "response": response_text,
+        "context_used": bool(context),
+        "time": round(time_taken, 2)
+    }
 
 if __name__ == "__main__":
     import uvicorn

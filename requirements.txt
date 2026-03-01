@@ -1,17 +1,27 @@
+# ── Core ML ──
+torch==2.2.2
 transformers==4.38.2
 peft==0.9.0
 accelerate==0.28.0
-torch==2.2.2
+trl==0.8.1
+datasets==2.18.0
+tokenizers
+sentencepiece
+
+# ── API ──
+fastapi
+uvicorn
+
+# ── Data Processing ──
 beautifulsoup4
 requests
 pandas
 lxml
-sentencepiece
-trl==0.8.1
-datasets==2.18.0
 numpy<2.0
-fastapi
-uvicorn
-rich
+
+# ── Vector DB & Embeddings ──
 chromadb
 sentence-transformers
+
+# ── Utilities ──
+rich

@@ -1,20 +1,26 @@
-# Python caches
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 
 # Virtual environment
 venv/
 env/
 .env
 
-# Data and Models
-data/
-models/
-*.jsonl
-*.txt
-!requirements.txt
-*.db
+# Model weights (large files)
+models/*.pt
+models/edufya-tokenizer/
 
-# OS files
+# Data artifacts
+data/chroma_db/
+data/*.jsonl
+data/raw_scraped.txt
+
+# Logs
+*.log
+
+# OS
 .DS_Store
+Thumbs.db
